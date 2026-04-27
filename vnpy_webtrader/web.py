@@ -16,7 +16,9 @@ from pathlib import Path
 from vnpy.rpc import RpcClient
 from vnpy.trader.object import (
     AccountData,
+    BarData,
     ContractData,
+    HistoryRequest,
     OrderData,
     OrderRequest,
     PositionData,
@@ -28,10 +30,13 @@ from vnpy.trader.object import (
 from vnpy.trader.constant import (
     Exchange,
     Direction,
+    Interval,
     OrderType,
     Offset,
 )
-from vnpy.trader.utility import load_json, get_file_path
+from vnpy.trader.database import DB_TZ, get_database
+from vnpy.trader.datafeed import get_datafeed
+from vnpy.trader.utility import BarGenerator, extract_vt_symbol, load_json, get_file_path
 
 
 # Web服务运行配置
@@ -77,6 +82,401 @@ class Token(BaseModel):
     """令牌数据"""
     access_token: str
     token_type: str
+
+
+class HistorySource(str, Enum):
+    """历史数据来源"""
+    AUTO = "auto"
+    DATABASE = "database"
+    DATAFEED = "datafeed"
+
+
+HISTORY_INTERVAL_ALIASES: dict[str, str] = {
+    "1m": "1m",
+    "1min": "1m",
+    "minute": "1m",
+    "5m": "5m",
+    "5min": "5m",
+    "15m": "15m",
+    "15min": "15m",
+    "30m": "30m",
+    "30min": "30m",
+    "1h": "1h",
+    "60m": "1h",
+    "hour": "1h",
+    "d": "d",
+    "1d": "d",
+    "day": "d",
+    "daily": "d",
+    "w": "w",
+    "1w": "w",
+    "week": "w",
+    "weekly": "w",
+}
+
+
+DIRECT_DB_INTERVALS: dict[str, Interval] = {
+    "1m": Interval.MINUTE,
+    "1h": Interval.HOUR,
+    "d": Interval.DAILY,
+    "w": Interval.WEEKLY,
+}
+
+
+DIRECT_DATAFEED_INTERVALS: dict[str, Interval] = {
+    "1m": Interval.MINUTE,
+    "d": Interval.DAILY,
+}
+
+
+SUPPORTED_HISTORY_INTERVALS: tuple[str, ...] = ("1m", "5m", "15m", "30m", "1h", "d", "w")
+
+
+def normalize_history_interval(raw_interval: str) -> str:
+    """标准化历史数据周期参数"""
+    interval_key: str = HISTORY_INTERVAL_ALIASES.get(raw_interval.strip().lower(), "")
+    if not interval_key:
+        supported: str = ", ".join(SUPPORTED_HISTORY_INTERVALS)
+        raise ValueError(f"不支持的K线周期：{raw_interval}，仅支持：{supported}")
+    return interval_key
+
+
+def normalize_query_datetime(dt: datetime) -> datetime:
+    """统一到数据库时区"""
+    if dt.tzinfo:
+        dt = dt.astimezone(DB_TZ)
+    else:
+        dt = dt.replace(tzinfo=DB_TZ)
+    return dt.replace(microsecond=0)
+
+
+def parse_query_datetime(raw_value: str, is_end: bool = False) -> datetime:
+    """解析查询参数中的时间"""
+    text: str = raw_value.strip()
+    if not text:
+        raise ValueError("时间参数不能为空")
+
+    date_only: bool = all(marker not in text for marker in ("T", " ", ":"))
+    normalized: str = text.replace("Z", "+00:00")
+
+    try:
+        dt: datetime = datetime.fromisoformat(normalized)
+    except ValueError:
+        dt = None
+
+    if dt is None:
+        formats: tuple[str, ...] = (
+            "%Y%m%d%H%M%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%dT%H:%M",
+            "%Y%m%d",
+            "%Y-%m-%d",
+        )
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+
+    if dt is None:
+        raise ValueError(f"无法解析时间参数：{raw_value}")
+
+    dt = normalize_query_datetime(dt)
+
+    if date_only and is_end:
+        dt = dt + timedelta(days=1) - timedelta(seconds=1)
+
+    return dt
+
+
+def align_history_start(start: datetime, interval_key: str) -> datetime:
+    """按查询周期向前对齐开始时间"""
+    if interval_key in {"1m", "5m", "15m", "30m"}:
+        minute: int = start.minute
+        if interval_key == "1m":
+            minute = minute
+        else:
+            window: int = int(interval_key[:-1])
+            minute = minute - minute % window
+        return start.replace(minute=minute, second=0, microsecond=0)
+
+    if interval_key == "1h":
+        return start.replace(minute=0, second=0, microsecond=0)
+
+    if interval_key == "d":
+        return start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    week_start: datetime = start - timedelta(days=start.weekday())
+    return week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def get_base_interval(interval_key: str) -> Interval:
+    """获取目标周期对应的基础周期"""
+    if interval_key in {"1m", "5m", "15m", "30m", "1h"}:
+        return Interval.MINUTE
+    return Interval.DAILY
+
+
+def requires_aggregation(interval_key: str) -> bool:
+    """判断是否需要通过基础周期聚合"""
+    return interval_key in {"5m", "15m", "30m", "1h", "w"}
+
+
+def database_has_bar_coverage(
+    symbol: str,
+    exchange: Exchange,
+    interval: Interval,
+    start: datetime,
+    end: datetime
+) -> bool:
+    """判断数据库是否覆盖所需时间范围"""
+    query_start: datetime = start.astimezone(DB_TZ).replace(tzinfo=None)
+    query_end: datetime = end.astimezone(DB_TZ).replace(tzinfo=None)
+
+    for overview in get_database().get_bar_overview():
+        if overview.symbol != symbol:
+            continue
+        if overview.exchange != exchange:
+            continue
+        if overview.interval != interval:
+            continue
+        if overview.start <= query_start and overview.end >= query_end:
+            return True
+    return False
+
+
+def filter_history_bars(bars: list[BarData], start: datetime, end: datetime) -> list[BarData]:
+    """按请求时间范围过滤K线"""
+    return [bar for bar in bars if start <= bar.datetime <= end]
+
+
+def aggregate_minute_window_bars(base_bars: list[BarData], window: int) -> list[BarData]:
+    """将1分钟K线聚合成多分钟K线"""
+    history: list[BarData] = []
+    generator: BarGenerator = BarGenerator(
+        on_bar=lambda bar: None,
+        window=window,
+        on_window_bar=history.append,
+        interval=Interval.MINUTE
+    )
+    for bar in base_bars:
+        generator.update_bar(bar)
+    return history
+
+
+def aggregate_hour_bars(base_bars: list[BarData]) -> list[BarData]:
+    """将1分钟K线聚合成1小时K线"""
+    history: list[BarData] = []
+    generator: BarGenerator = BarGenerator(
+        on_bar=lambda bar: None,
+        window=1,
+        on_window_bar=history.append,
+        interval=Interval.HOUR
+    )
+    for bar in base_bars:
+        generator.update_bar(bar)
+
+    for bar in history:
+        bar.interval = Interval.HOUR
+
+    return history
+
+
+def aggregate_weekly_bars(base_bars: list[BarData]) -> list[BarData]:
+    """将日线聚合成周线"""
+    history: list[BarData] = []
+    weekly_bar: BarData | None = None
+
+    for bar in base_bars:
+        week_start: datetime = (bar.datetime - timedelta(days=bar.datetime.weekday())).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0
+        )
+
+        if not weekly_bar or weekly_bar.datetime != week_start:
+            if weekly_bar:
+                history.append(weekly_bar)
+
+            weekly_bar = BarData(
+                symbol=bar.symbol,
+                exchange=bar.exchange,
+                datetime=week_start,
+                interval=Interval.WEEKLY,
+                volume=bar.volume,
+                turnover=bar.turnover,
+                open_interest=bar.open_interest,
+                open_price=bar.open_price,
+                high_price=bar.high_price,
+                low_price=bar.low_price,
+                close_price=bar.close_price,
+                gateway_name=bar.gateway_name
+            )
+            continue
+
+        weekly_bar.high_price = max(weekly_bar.high_price, bar.high_price)
+        weekly_bar.low_price = min(weekly_bar.low_price, bar.low_price)
+        weekly_bar.close_price = bar.close_price
+        weekly_bar.volume += bar.volume
+        weekly_bar.turnover += bar.turnover
+        weekly_bar.open_interest = bar.open_interest
+
+    if weekly_bar:
+        history.append(weekly_bar)
+
+    return history
+
+
+def aggregate_history_bars(
+    base_bars: list[BarData],
+    interval_key: str,
+    start: datetime,
+    end: datetime
+) -> list[BarData]:
+    """根据目标周期聚合K线"""
+    if not base_bars:
+        return []
+
+    if interval_key in {"5m", "15m", "30m"}:
+        window: int = int(interval_key[:-1])
+        history: list[BarData] = aggregate_minute_window_bars(base_bars, window)
+    elif interval_key == "1h":
+        history = aggregate_hour_bars(base_bars)
+    elif interval_key == "w":
+        history = aggregate_weekly_bars(base_bars)
+    else:
+        history = base_bars
+
+    return filter_history_bars(history, start, end)
+
+
+def load_bars_from_database(
+    symbol: str,
+    exchange: Exchange,
+    interval_key: str,
+    start: datetime,
+    end: datetime
+) -> list[BarData]:
+    """从本地数据库读取历史K线"""
+    database = get_database()
+    query_start: datetime = align_history_start(start, interval_key)
+
+    direct_interval: Interval | None = DIRECT_DB_INTERVALS.get(interval_key, None)
+    if direct_interval:
+        history: list[BarData] = database.load_bar_data(
+            symbol,
+            exchange,
+            direct_interval,
+            query_start,
+            end
+        )
+        if history or not requires_aggregation(interval_key):
+            return filter_history_bars(history, start, end)
+
+    base_interval: Interval = get_base_interval(interval_key)
+    history = database.load_bar_data(
+        symbol,
+        exchange,
+        base_interval,
+        query_start,
+        end
+    )
+    return aggregate_history_bars(history, interval_key, start, end)
+
+
+def load_bars_from_datafeed(
+    symbol: str,
+    exchange: Exchange,
+    interval_key: str,
+    start: datetime,
+    end: datetime
+) -> list[BarData]:
+    """从数据服务读取历史K线"""
+    datafeed = get_datafeed()
+    query_start: datetime = align_history_start(start, interval_key)
+
+    direct_interval: Interval | None = DIRECT_DATAFEED_INTERVALS.get(interval_key, None)
+    if direct_interval:
+        req: HistoryRequest = HistoryRequest(
+            symbol=symbol,
+            exchange=exchange,
+            interval=direct_interval,
+            start=query_start,
+            end=end
+        )
+        history: list[BarData] = datafeed.query_bar_history(req) or []
+        return filter_history_bars(history, start, end)
+
+    base_interval: Interval = get_base_interval(interval_key)
+    req = HistoryRequest(
+        symbol=symbol,
+        exchange=exchange,
+        interval=base_interval,
+        start=query_start,
+        end=end
+    )
+    history = datafeed.query_bar_history(req) or []
+    return aggregate_history_bars(history, interval_key, start, end)
+
+
+def can_fulfill_from_database(
+    symbol: str,
+    exchange: Exchange,
+    interval_key: str,
+    start: datetime,
+    end: datetime
+) -> bool:
+    """判断数据库是否足够覆盖请求范围"""
+    direct_interval: Interval | None = DIRECT_DB_INTERVALS.get(interval_key, None)
+    if direct_interval and database_has_bar_coverage(symbol, exchange, direct_interval, start, end):
+        return True
+
+    if not requires_aggregation(interval_key):
+        return False
+
+    query_start: datetime = align_history_start(start, interval_key)
+    base_interval: Interval = get_base_interval(interval_key)
+    return database_has_bar_coverage(symbol, exchange, base_interval, query_start, end)
+
+
+def query_history_bars(
+    vt_symbol: str,
+    interval_key: str,
+    start: datetime,
+    end: datetime,
+    source: HistorySource
+) -> tuple[list[BarData], str]:
+    """按指定来源查询历史K线"""
+    symbol, exchange = extract_vt_symbol(vt_symbol)
+
+    if source == HistorySource.DATABASE:
+        history: list[BarData] = load_bars_from_database(symbol, exchange, interval_key, start, end)
+        return history, HistorySource.DATABASE.value
+
+    if source == HistorySource.DATAFEED:
+        history = load_bars_from_datafeed(symbol, exchange, interval_key, start, end)
+        return history, HistorySource.DATAFEED.value
+
+    db_history: list[BarData] = load_bars_from_database(symbol, exchange, interval_key, start, end)
+    if db_history and can_fulfill_from_database(symbol, exchange, interval_key, start, end):
+        return db_history, HistorySource.DATABASE.value
+
+    datafeed_history: list[BarData] = load_bars_from_datafeed(symbol, exchange, interval_key, start, end)
+    if datafeed_history:
+        return datafeed_history, HistorySource.DATAFEED.value
+
+    return db_history, HistorySource.DATABASE.value
+
+
+def history_bar_to_dict(bar: BarData, interval_key: str) -> dict:
+    """序列化历史K线"""
+    data: dict = to_dict(bar)
+    data["interval"] = interval_key
+    return data
 
 
 def authenticate_user(current_username: str, username: str, password: str) -> str | Literal[False]:
@@ -258,6 +658,60 @@ def get_all_contracts(access: bool = Depends(get_access)) -> list:
     """查询合约信息"""
     contracts: list[ContractData] = rpc_client.get_all_contracts()
     return [to_dict(contract) for contract in contracts]
+
+
+@app.get("/history/bar/{vt_symbol}")
+def get_bar_history(
+    vt_symbol: str,
+    interval: str,
+    start: str,
+    end: str | None = None,
+    source: HistorySource = Query(HistorySource.AUTO),
+    limit: int | None = Query(default=None, ge=1),
+    access: bool = Depends(get_access)
+) -> dict:
+    """查询指定标的历史K线"""
+    try:
+        interval_key: str = normalize_history_interval(interval)
+        start_dt: datetime = parse_query_datetime(start)
+        end_dt: datetime = parse_query_datetime(end, is_end=True) if end else datetime.now(DB_TZ)
+        symbol, exchange = extract_vt_symbol(vt_symbol)
+    except ValueError as err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(err),
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from err
+
+    if end_dt < start_dt:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="结束时间必须大于或等于开始时间",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    history, actual_source = query_history_bars(
+        vt_symbol,
+        interval_key,
+        start_dt,
+        end_dt,
+        source
+    )
+
+    if limit:
+        history = history[-limit:]
+
+    return {
+        "vt_symbol": vt_symbol,
+        "symbol": symbol,
+        "exchange": exchange.value,
+        "interval": interval_key,
+        "source": actual_source,
+        "count": len(history),
+        "start": str(start_dt),
+        "end": str(end_dt),
+        "data": [history_bar_to_dict(bar, interval_key) for bar in history],
+    }
 
 
 # 活动状态的Websocket连接
