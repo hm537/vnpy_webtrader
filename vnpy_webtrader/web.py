@@ -141,6 +141,23 @@ def normalize_history_interval(raw_interval: str) -> str:
     return interval_key
 
 
+def normalize_rpc_client_address(address: str) -> str:
+    """将通配监听地址转换为客户端可连接的回环地址"""
+    normalized: str = address.strip()
+
+    wildcard_hosts: tuple[str, ...] = (
+        "tcp://0.0.0.0:",
+        "tcp://*:",
+        "tcp://[::]:",
+        "tcp://:::",
+    )
+    for prefix in wildcard_hosts:
+        if normalized.startswith(prefix):
+            return normalized.replace(prefix, "tcp://127.0.0.1:", 1)
+
+    return normalized
+
+
 def normalize_query_datetime(dt: datetime) -> datetime:
     """统一到数据库时区"""
     if dt.tzinfo:
@@ -788,7 +805,9 @@ def startup_event() -> None:
     rpc_client = RpcClient()
     rpc_client.callback = rpc_callback
     rpc_client.subscribe_topic("")
-    rpc_client.start(REQ_ADDRESS, SUB_ADDRESS)
+    req_address: str = normalize_rpc_client_address(REQ_ADDRESS)
+    sub_address: str = normalize_rpc_client_address(SUB_ADDRESS)
+    rpc_client.start(req_address, sub_address)
 
 
 @app.on_event("shutdown")
