@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from hashlib import sha256
 
 from vnpy.event import EventEngine
 from vnpy.trader.engine import MainEngine
@@ -38,6 +39,11 @@ class WebManager(QtWidgets.QWidget):
         port: str = setting.get("port", "8000")
         mcp_enabled: bool = bool(setting.get("mcp_enabled", False))
         mcp_enable_trading: bool = bool(setting.get("mcp_enable_trading", False))
+        mcp_tokens: dict = setting.get("mcp_tokens") or {}
+        mcp_agent_name: str = next(iter(mcp_tokens), "agent-01")
+        mcp_token_record: dict = mcp_tokens.get(mcp_agent_name, {})
+        mcp_can_trade: bool = bool(mcp_token_record.get("can_trade", False))
+        mcp_audit_log: str = setting.get("mcp_audit_log", "web_trader_mcp_audit.jsonl")
 
         self.username_line: QtWidgets.QLineEdit = QtWidgets.QLineEdit(username)
         self.password_line: QtWidgets.QLineEdit = QtWidgets.QLineEdit(password)
@@ -49,6 +55,13 @@ class WebManager(QtWidgets.QWidget):
         self.mcp_enabled_checkbox.setChecked(mcp_enabled)
         self.mcp_trading_checkbox: QtWidgets.QCheckBox = QtWidgets.QCheckBox()
         self.mcp_trading_checkbox.setChecked(mcp_enable_trading)
+        self.mcp_agent_line: QtWidgets.QLineEdit = QtWidgets.QLineEdit(mcp_agent_name)
+        self.mcp_token_line: QtWidgets.QLineEdit = QtWidgets.QLineEdit()
+        self.mcp_token_line.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.mcp_token_line.setPlaceholderText("留空则保留已有token")
+        self.mcp_token_trade_checkbox: QtWidgets.QCheckBox = QtWidgets.QCheckBox()
+        self.mcp_token_trade_checkbox.setChecked(mcp_can_trade)
+        self.mcp_audit_line: QtWidgets.QLineEdit = QtWidgets.QLineEdit(mcp_audit_log)
 
         self.start_button: QtWidgets.QPushButton = QtWidgets.QPushButton("启动")
         self.start_button.clicked.connect(self.start)
@@ -68,6 +81,10 @@ class WebManager(QtWidgets.QWidget):
         form.addRow("监听端口", self.port_line)
         form.addRow("启用MCP", self.mcp_enabled_checkbox)
         form.addRow("启用MCP交易", self.mcp_trading_checkbox)
+        form.addRow("MCP Agent", self.mcp_agent_line)
+        form.addRow("MCP Token", self.mcp_token_line)
+        form.addRow("MCP Token交易", self.mcp_token_trade_checkbox)
+        form.addRow("MCP审计日志", self.mcp_audit_line)
         form.addRow(self.start_button)
         form.addRow(self.end_button)
 
@@ -90,9 +107,20 @@ class WebManager(QtWidgets.QWidget):
         port: str = self.port_line.text()
         mcp_enabled: bool = self.mcp_enabled_checkbox.isChecked()
         mcp_enable_trading: bool = self.mcp_trading_checkbox.isChecked()
+        mcp_agent_name: str = self.mcp_agent_line.text().strip() or "agent-01"
+        mcp_token: str = self.mcp_token_line.text().strip()
+        mcp_can_trade: bool = self.mcp_token_trade_checkbox.isChecked()
+        mcp_audit_log: str = self.mcp_audit_line.text().strip() or "web_trader_mcp_audit.jsonl"
 
         # 保存配置
         old_setting: dict = load_json(self.setting_filepath)
+        mcp_tokens: dict = dict(old_setting.get("mcp_tokens") or {})
+        old_token_record: dict = dict(mcp_tokens.get(mcp_agent_name, {}))
+        if mcp_token:
+            old_token_record["token_sha256"] = sha256(mcp_token.encode("utf-8")).hexdigest()
+        old_token_record["can_trade"] = mcp_can_trade
+        mcp_tokens[mcp_agent_name] = old_token_record
+
         setting: dict = {
             **old_setting,
             "username": username,
@@ -102,7 +130,9 @@ class WebManager(QtWidgets.QWidget):
             "host": host,
             "port": port,
             "mcp_enabled": mcp_enabled,
-            "mcp_enable_trading": mcp_enable_trading
+            "mcp_tokens": mcp_tokens,
+            "mcp_enable_trading": mcp_enable_trading,
+            "mcp_audit_log": mcp_audit_log
         }
         save_json(self.setting_filepath, setting)
 
@@ -146,6 +176,10 @@ class WebManager(QtWidgets.QWidget):
             self.port_line,
             self.mcp_enabled_checkbox,
             self.mcp_trading_checkbox,
+            self.mcp_agent_line,
+            self.mcp_token_line,
+            self.mcp_token_trade_checkbox,
+            self.mcp_audit_line,
             self.start_button
         ]:
             w.setEnabled(False)
@@ -165,6 +199,10 @@ class WebManager(QtWidgets.QWidget):
             self.port_line,
             self.mcp_enabled_checkbox,
             self.mcp_trading_checkbox,
+            self.mcp_agent_line,
+            self.mcp_token_line,
+            self.mcp_token_trade_checkbox,
+            self.mcp_audit_line,
             self.start_button
         ]:
             w.setEnabled(True)
