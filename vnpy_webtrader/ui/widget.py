@@ -36,6 +36,8 @@ class WebManager(QtWidgets.QWidget):
         sub_address: str = setting.get("sub_address", "tcp://127.0.0.1:4102")
         host: str = setting.get("host", "127.0.0.1")
         port: str = setting.get("port", "8000")
+        mcp_enabled: bool = bool(setting.get("mcp_enabled", False))
+        mcp_enable_trading: bool = bool(setting.get("mcp_enable_trading", False))
 
         self.username_line: QtWidgets.QLineEdit = QtWidgets.QLineEdit(username)
         self.password_line: QtWidgets.QLineEdit = QtWidgets.QLineEdit(password)
@@ -43,6 +45,10 @@ class WebManager(QtWidgets.QWidget):
         self.sub_line: QtWidgets.QLineEdit = QtWidgets.QLineEdit(sub_address)
         self.host_line: QtWidgets.QLineEdit = QtWidgets.QLineEdit(host)
         self.port_line: QtWidgets.QLineEdit = QtWidgets.QLineEdit(port)
+        self.mcp_enabled_checkbox: QtWidgets.QCheckBox = QtWidgets.QCheckBox()
+        self.mcp_enabled_checkbox.setChecked(mcp_enabled)
+        self.mcp_trading_checkbox: QtWidgets.QCheckBox = QtWidgets.QCheckBox()
+        self.mcp_trading_checkbox.setChecked(mcp_enable_trading)
 
         self.start_button: QtWidgets.QPushButton = QtWidgets.QPushButton("启动")
         self.start_button.clicked.connect(self.start)
@@ -60,6 +66,8 @@ class WebManager(QtWidgets.QWidget):
         form.addRow("订阅地址", self.sub_line)
         form.addRow("监听地址", self.host_line)
         form.addRow("监听端口", self.port_line)
+        form.addRow("启用MCP", self.mcp_enabled_checkbox)
+        form.addRow("启用MCP交易", self.mcp_trading_checkbox)
         form.addRow(self.start_button)
         form.addRow(self.end_button)
 
@@ -80,15 +88,21 @@ class WebManager(QtWidgets.QWidget):
         sub_address: str = self.sub_line.text()
         host: str = self.host_line.text()
         port: str = self.port_line.text()
+        mcp_enabled: bool = self.mcp_enabled_checkbox.isChecked()
+        mcp_enable_trading: bool = self.mcp_trading_checkbox.isChecked()
 
         # 保存配置
+        old_setting: dict = load_json(self.setting_filepath)
         setting: dict = {
+            **old_setting,
             "username": username,
             "password": password,
             "req_address": req_address,
             "sub_address": sub_address,
             "host": host,
-            "port": port
+            "port": port,
+            "mcp_enabled": mcp_enabled,
+            "mcp_enable_trading": mcp_enable_trading
         }
         save_json(self.setting_filepath, setting)
 
@@ -130,6 +144,8 @@ class WebManager(QtWidgets.QWidget):
             self.sub_line,
             self.host_line,
             self.port_line,
+            self.mcp_enabled_checkbox,
+            self.mcp_trading_checkbox,
             self.start_button
         ]:
             w.setEnabled(False)
@@ -147,6 +163,8 @@ class WebManager(QtWidgets.QWidget):
             self.sub_line,
             self.host_line,
             self.port_line,
+            self.mcp_enabled_checkbox,
+            self.mcp_trading_checkbox,
             self.start_button
         ]:
             w.setEnabled(True)
