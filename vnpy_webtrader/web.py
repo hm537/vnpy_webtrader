@@ -2,6 +2,7 @@ from enum import Enum
 from typing import Any, Literal
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 import secrets
 
@@ -12,6 +13,7 @@ from pydantic import BaseModel
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from pathlib import Path
+from starlette.middleware import Middleware
 
 from vnpy.rpc import RpcClient
 from vnpy.trader.object import (
@@ -38,6 +40,10 @@ from vnpy.trader.database import DB_TZ, get_database
 from vnpy.trader.datafeed import get_datafeed
 from vnpy.trader.utility import BarGenerator, extract_vt_symbol, load_json, get_file_path
 
+from vnpy_webtrader.mcp_audit import McpAuditLogger
+from vnpy_webtrader.mcp_auth import McpBearerAuthMiddleware, load_mcp_auth_config
+from vnpy_webtrader.mcp_server import WebTraderMcpCallbacks, create_webtrader_mcp_server
+
 
 # Web服务运行配置
 SETTING_FILENAME = "web_trader_setting.json"
@@ -48,6 +54,10 @@ USERNAME = setting["username"]              # 用户名
 PASSWORD = setting["password"]              # 密码
 REQ_ADDRESS = setting["req_address"]        # 请求服务地址
 SUB_ADDRESS = setting["sub_address"]        # 订阅服务地址
+
+
+MCP_AUTH_CONFIG = load_mcp_auth_config(setting)
+MCP_AUDIT_LOG = setting.get("mcp_audit_log", "web_trader_mcp_audit.jsonl")
 
 
 SECRET_KEY = "test"                     # 数据加密密钥
@@ -82,6 +92,18 @@ class Token(BaseModel):
     """令牌数据"""
     access_token: str
     token_type: str
+
+
+class OrderRequestModel(BaseModel):
+    """委托请求模型"""
+    symbol: str
+    exchange: Exchange
+    direction: Direction
+    type: OrderType
+    volume: float
+    price: float = 0
+    offset: Offset = Offset.NONE
+    reference: str = ""
 
 
 class HistorySource(str, Enum):
@@ -545,8 +567,261 @@ async def get_access(token: str = Depends(oauth2_scheme)) -> bool:
     return True
 
 
+def parse_enum_value(enum_type: type[Enum], raw_value: str | Enum) -> Enum:
+    """按枚举名称或枚举值解析参数"""
+    if isinstance(raw_value, enum_type):
+        return raw_value
+
+    text: str = str(raw_value).strip()
+    for item in enum_type:
+        if text == item.value or text.upper() == item.name:
+            return item
+
+    raise ValueError(f"无法解析{enum_type.__name__}参数：{raw_value}")
+
+
+def ensure_rpc_client() -> RpcClient:
+    """获取已启动的RPC客户端"""
+    if rpc_client is None:
+        raise RuntimeError("RPC客户端尚未启动")
+    return rpc_client
+
+
+def query_contract(vt_symbol: str) -> ContractData | None:
+    """查询单个合约"""
+    return ensure_rpc_client().get_contract(vt_symbol)
+
+
+def subscribe_tick(vt_symbol: str) -> None:
+    """订阅行情"""
+    contract: ContractData | None = query_contract(vt_symbol)
+    if not contract:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"找不到合约{vt_symbol}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    req: SubscribeRequest = SubscribeRequest(contract.symbol, contract.exchange)
+    ensure_rpc_client().subscribe(req, contract.gateway_name)
+
+
+def query_all_ticks() -> list:
+    """查询全部行情信息"""
+    ticks: list[TickData] = ensure_rpc_client().get_all_ticks()
+    return [to_dict(tick) for tick in ticks]
+
+
+def query_all_orders() -> list:
+    """查询全部委托"""
+    orders: list[OrderData] = ensure_rpc_client().get_all_orders()
+    return [to_dict(order) for order in orders]
+
+
+def query_all_trades() -> list:
+    """查询全部成交"""
+    trades: list[TradeData] = ensure_rpc_client().get_all_trades()
+    return [to_dict(trade) for trade in trades]
+
+
+def query_all_positions() -> list:
+    """查询全部持仓"""
+    positions: list[PositionData] = ensure_rpc_client().get_all_positions()
+    return [to_dict(position) for position in positions]
+
+
+def query_all_accounts() -> list:
+    """查询全部账户资金"""
+    accounts: list[AccountData] = ensure_rpc_client().get_all_accounts()
+    return [to_dict(account) for account in accounts]
+
+
+def query_all_contracts() -> list:
+    """查询全部合约"""
+    contracts: list[ContractData] = ensure_rpc_client().get_all_contracts()
+    return [to_dict(contract) for contract in contracts]
+
+
+def place_order(model: OrderRequestModel) -> str:
+    """发送委托"""
+    req: OrderRequest = OrderRequest(**model.__dict__)
+
+    contract: ContractData | None = query_contract(req.vt_symbol)
+    if not contract:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"找不到合约{req.symbol} {req.exchange.value}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    vt_orderid: str = ensure_rpc_client().send_order(req, contract.gateway_name)
+    return vt_orderid
+
+
+def place_order_from_payload(payload: dict) -> str:
+    """按字典参数发送委托"""
+    model = OrderRequestModel(
+        symbol=str(payload["symbol"]),
+        exchange=parse_enum_value(Exchange, payload["exchange"]),
+        direction=parse_enum_value(Direction, payload["direction"]),
+        type=parse_enum_value(OrderType, payload["type"]),
+        volume=float(payload["volume"]),
+        price=float(payload.get("price", 0)),
+        offset=parse_enum_value(Offset, payload.get("offset", "")),
+        reference=str(payload.get("reference", "")),
+    )
+    return place_order(model)
+
+
+def cancel_existing_order(vt_orderid: str) -> None:
+    """撤销委托"""
+    order: OrderData | None = ensure_rpc_client().get_order(vt_orderid)
+    if not order:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"找不到委托{vt_orderid}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    req: CancelRequest = order.create_cancel_request()
+    ensure_rpc_client().cancel_order(req, order.gateway_name)
+
+
+def build_history_bar_response(
+    vt_symbol: str,
+    interval: str,
+    start: str,
+    end: str | None = None,
+    source: str | HistorySource = HistorySource.AUTO,
+    limit: int | None = None
+) -> dict:
+    """构造历史K线查询响应"""
+    try:
+        interval_key: str = normalize_history_interval(interval)
+        start_dt: datetime = parse_query_datetime(start)
+        end_dt: datetime = parse_query_datetime(end, is_end=True) if end else datetime.now(DB_TZ)
+        symbol, exchange = extract_vt_symbol(vt_symbol)
+        source_enum: HistorySource = source if isinstance(source, HistorySource) else HistorySource(str(source))
+    except ValueError as err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(err),
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from err
+
+    if limit is not None and limit < 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="limit必须大于等于1",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if end_dt < start_dt:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="结束时间必须大于或等于开始时间",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    history, actual_source = query_history_bars(
+        vt_symbol,
+        interval_key,
+        start_dt,
+        end_dt,
+        source_enum
+    )
+
+    if limit:
+        history = history[-limit:]
+
+    return {
+        "vt_symbol": vt_symbol,
+        "symbol": symbol,
+        "exchange": exchange.value,
+        "interval": interval_key,
+        "source": actual_source,
+        "count": len(history),
+        "start": str(start_dt),
+        "end": str(end_dt),
+        "data": [history_bar_to_dict(bar, interval_key) for bar in history],
+    }
+
+
+def mcp_health_check() -> dict:
+    """查询MCP服务健康状态"""
+    return {
+        "rpc_client_started": rpc_client is not None,
+        "mcp_enabled": MCP_AUTH_CONFIG.enabled,
+        "mcp_enable_trading": MCP_AUTH_CONFIG.enable_trading,
+        "mcp_agent_count": len(MCP_AUTH_CONFIG.tokens),
+        "supported_history_intervals": SUPPORTED_HISTORY_INTERVALS,
+    }
+
+
+def resolve_mcp_audit_log_path(raw_path: str | None) -> Path | None:
+    """解析MCP审计日志路径"""
+    if not raw_path:
+        return None
+
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+
+    return get_file_path(raw_path)
+
+
+def start_rpc_client() -> None:
+    """启动RPC客户端"""
+    global event_loop, rpc_client
+    event_loop = asyncio.get_running_loop()
+    rpc_client = RpcClient()
+    rpc_client.callback = rpc_callback
+    rpc_client.subscribe_topic("")
+    req_address: str = normalize_rpc_client_address(REQ_ADDRESS)
+    sub_address: str = normalize_rpc_client_address(SUB_ADDRESS)
+    rpc_client.start(req_address, sub_address)
+
+
+def stop_rpc_client() -> None:
+    """停止RPC客户端"""
+    if rpc_client:
+        rpc_client.stop()
+
+
+mcp_audit_logger = McpAuditLogger(resolve_mcp_audit_log_path(MCP_AUDIT_LOG))
+mcp_server = create_webtrader_mcp_server(
+    WebTraderMcpCallbacks(
+        health_check=mcp_health_check,
+        get_accounts=query_all_accounts,
+        get_positions=query_all_positions,
+        get_orders=query_all_orders,
+        get_trades=query_all_trades,
+        get_contracts=query_all_contracts,
+        get_ticks=query_all_ticks,
+        subscribe_tick=subscribe_tick,
+        get_history_bars=build_history_bar_response,
+        place_order=place_order_from_payload,
+        cancel_order=cancel_existing_order,
+    ),
+    MCP_AUTH_CONFIG,
+    mcp_audit_logger,
+)
+mcp_http_app = mcp_server.http_app(path="/mcp", transport="streamable-http")
+
+
+@asynccontextmanager
+async def app_lifespan(app: FastAPI):
+    """组合WebTrader RPC和FastMCP HTTP生命周期"""
+    start_rpc_client()
+    async with mcp_http_app.lifespan(mcp_http_app):
+        yield
+    stop_rpc_client()
+
+
 # 创建FastAPI应用
-app: FastAPI = FastAPI()
+app: FastAPI = FastAPI(lifespan=app_lifespan)
+app.add_middleware(McpBearerAuthMiddleware, auth_config=MCP_AUTH_CONFIG)
+app.router.routes.extend(mcp_http_app.router.routes)
 
 
 @app.get("/")
@@ -579,102 +854,55 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()) -> dict:  # noqa: B0
 @app.post("/tick/{vt_symbol}")
 def subscribe(vt_symbol: str, access: bool = Depends(get_access)) -> None:
     """订阅行情"""
-    contract: ContractData | None = rpc_client.get_contract(vt_symbol)
-    if not contract:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"找不到合约{vt_symbol}",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    req: SubscribeRequest = SubscribeRequest(contract.symbol, contract.exchange)
-    rpc_client.subscribe(req, contract.gateway_name)
+    subscribe_tick(vt_symbol)
 
 
 @app.get("/tick")
 def get_all_ticks(access: bool = Depends(get_access)) -> list:
     """查询行情信息"""
-    ticks: list[TickData] = rpc_client.get_all_ticks()
-    return [to_dict(tick) for tick in ticks]
-
-
-class OrderRequestModel(BaseModel):
-    """委托请求模型"""
-    symbol: str
-    exchange: Exchange
-    direction: Direction
-    type: OrderType
-    volume: float
-    price: float = 0
-    offset: Offset = Offset.NONE
-    reference: str = ""
+    return query_all_ticks()
 
 
 @app.post("/order")
 def send_order(model: OrderRequestModel, access: bool = Depends(get_access)) -> str:
     """委托下单"""
-    req: OrderRequest = OrderRequest(**model.__dict__)
-
-    contract: ContractData | None = rpc_client.get_contract(req.vt_symbol)
-    if not contract:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"找不到合约{req.symbol} {req.exchange.value}",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    vt_orderid: str = rpc_client.send_order(req, contract.gateway_name)
-    return vt_orderid
+    return place_order(model)
 
 
 @app.delete("/order/{vt_orderid}")
 def cancel_order(vt_orderid: str, access: bool = Depends(get_access)) -> None:
     """委托撤单"""
-    order: OrderData | None = rpc_client.get_order(vt_orderid)
-    if not order:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"找不到委托{vt_orderid}",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    req: CancelRequest = order.create_cancel_request()
-    rpc_client.cancel_order(req, order.gateway_name)
+    cancel_existing_order(vt_orderid)
 
 
 @app.get("/order")
 def get_all_orders(access: bool = Depends(get_access)) -> list:
     """查询委托信息"""
-    orders: list[OrderData] = rpc_client.get_all_orders()
-    return [to_dict(order) for order in orders]
+    return query_all_orders()
 
 
 @app.get("/trade")
 def get_all_trades(access: bool = Depends(get_access)) -> list:
     """查询成交信息"""
-    trades: list[TradeData] = rpc_client.get_all_trades()
-    return [to_dict(trade) for trade in trades]
+    return query_all_trades()
 
 
 @app.get("/position")
 def get_all_positions(access: bool = Depends(get_access)) -> list:
     """查询持仓信息"""
-    positions: list[PositionData] = rpc_client.get_all_positions()
-    return [to_dict(position) for position in positions]
+    return query_all_positions()
 
 
 @app.get("/account")
 def get_all_accounts(access: bool = Depends(get_access)) -> list:
     """查询账户资金"""
-    accounts: list[AccountData] = rpc_client.get_all_accounts()
-    return [to_dict(account) for account in accounts]
+    return query_all_accounts()
 
 
 @app.get("/contract")
 def get_all_contracts(access: bool = Depends(get_access)) -> list:
     """查询合约信息"""
-    contracts: list[ContractData] = rpc_client.get_all_contracts()
-    return [to_dict(contract) for contract in contracts]
+    return query_all_contracts()
 
 
 @app.get("/history/bar/{vt_symbol}")
@@ -688,54 +916,14 @@ def get_bar_history(
     access: bool = Depends(get_access)
 ) -> dict:
     """查询指定标的历史K线"""
-    try:
-        interval_key: str = normalize_history_interval(interval)
-        start_dt: datetime = parse_query_datetime(start)
-        end_dt: datetime = parse_query_datetime(end, is_end=True) if end else datetime.now(DB_TZ)
-        symbol, exchange = extract_vt_symbol(vt_symbol)
-    except ValueError as err:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(err),
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from err
-
-    if end_dt < start_dt:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="结束时间必须大于或等于开始时间",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    history, actual_source = query_history_bars(
-        vt_symbol,
-        interval_key,
-        start_dt,
-        end_dt,
-        source
-    )
-
-    if limit:
-        history = history[-limit:]
-
-    return {
-        "vt_symbol": vt_symbol,
-        "symbol": symbol,
-        "exchange": exchange.value,
-        "interval": interval_key,
-        "source": actual_source,
-        "count": len(history),
-        "start": str(start_dt),
-        "end": str(end_dt),
-        "data": [history_bar_to_dict(bar, interval_key) for bar in history],
-    }
+    return build_history_bar_response(vt_symbol, interval, start, end, source, limit)
 
 
 # 活动状态的Websocket连接
 active_websockets: list[WebSocket] = []
 
 # 全局事件循环
-event_loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
+event_loop: asyncio.AbstractEventLoop | None = None
 
 
 async def get_websocket_access(
@@ -787,7 +975,7 @@ async def websocket_broadcast(msg: str) -> None:
 
 def rpc_callback(topic: str, data: Any) -> None:
     """RPC回调函数"""
-    if not active_websockets:
+    if not active_websockets or not event_loop:
         return
 
     message_data: dict = {
@@ -796,21 +984,3 @@ def rpc_callback(topic: str, data: Any) -> None:
     }
     msg: str = json.dumps(message_data, ensure_ascii=False)
     asyncio.run_coroutine_threadsafe(websocket_broadcast(msg), event_loop)
-
-
-@app.on_event("startup")
-def startup_event() -> None:
-    """应用启动事件"""
-    global rpc_client
-    rpc_client = RpcClient()
-    rpc_client.callback = rpc_callback
-    rpc_client.subscribe_topic("")
-    req_address: str = normalize_rpc_client_address(REQ_ADDRESS)
-    sub_address: str = normalize_rpc_client_address(SUB_ADDRESS)
-    rpc_client.start(req_address, sub_address)
-
-
-@app.on_event("shutdown")
-def shutdown_event() -> None:
-    """应用停止事件"""
-    rpc_client.stop()
